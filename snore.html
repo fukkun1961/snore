@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>いびきレコーダー</title>
+<style>
+  :root { color-scheme: dark; --bg:#0f1420; --card:#1a2133; --fg:#e8ecf5; --sub:#8b95ad; --acc:#5b9dff; --red:#ff6b6b; --ok:#4cd9a0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,"Hiragino Sans",sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); max-width:560px; margin:0 auto; }
+  h1 { font-size:20px; margin:8px 0 14px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin-bottom:12px; }
+  button { font:inherit; border:0; border-radius:12px; padding:14px; background:var(--acc); color:#fff; font-weight:600; width:100%; }
+  button.stop { background:var(--red); }
+  button.ghost { background:#2a3350; font-weight:500; padding:10px; }
+  .row { display:flex; gap:8px; }
+  .meter { height:14px; background:#0b0f19; border-radius:7px; position:relative; overflow:hidden; margin:10px 0 4px; }
+  .bar { height:100%; width:0; background:var(--ok); transition: width .08s; }
+  .thr { position:absolute; top:0; bottom:0; width:2px; background:#fff; opacity:.8; }
+  .sub { color:var(--sub); font-size:13px; line-height:1.5; }
+  .status { font-size:15px; margin-top:8px; }
+  .rec { color:var(--red); font-weight:700; }
+  label { font-size:14px; display:block; margin-bottom:4px; }
+  input[type=range] { width:100%; }
+  .clip { border-top:1px solid #2a3350; padding:10px 0; }
+  .clip:first-child { border-top:0; }
+  .clip audio { width:100%; margin:6px 0; }
+  .clip .meta { font-size:14px; }
+  #dim { position:fixed; inset:0; background:#000; z-index:10; display:none; align-items:flex-end; justify-content:center; padding-bottom:40px; color:#222; font-size:13px; }
+  #dim.on { display:flex; }
+</style>
+</head>
+<body>
+<h1>🌙 いびきレコーダー</h1>
+
+<div class="card">
+  <button id="btn">監視をはじめる</button>
+  <div class="meter"><div class="bar" id="bar"></div><div class="thr" id="thr"></div></div>
+  <div class="status" id="status">待機中</div>
+  <div class="sub" id="info"></div>
+</div>
+
+<div class="card">
+  <label>感度(右ほど小さい音も拾う): <span id="sensVal"></span></label>
+  <input type="range" id="sens" min="4" max="24" value="12">
+  <div class="row" style="margin-top:10px">
+    <button class="ghost" id="dimBtn">画面を暗くする</button>
+  </div>
+  <p class="sub">使い方:充電しながら枕元に置いて、このページを開いたまま「画面を暗くする」を押す。Safariを閉じたり画面ロックすると止まるので、自動ロックは「なし」にしてね。</p>
+</div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <strong>録音一覧</strong><span class="sub" id="summary"></span>
+  </div>
+  <div id="list"></div>
+  <button class="ghost" id="clear" style="margin-top:10px">全部削除</button>
+  <p class="sub">録音はこの端末のブラウザ内に保存。しばらく開かないと消えることがあるので、残したいものは「保存」で書き出してね。</p>
+</div>
+
+<div id="dim"><span>タップで明るくする</span></div>
+
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const PRE_SEC = 3, TAIL_SEC = 2, GAP_SEC = 8, MAX_SEC = 300, MIN_BURSTS = 2, LOW_RATIO_MIN = 0.55;
+
+// ---------- IndexedDB ----------
+let db = null;
+const dbReady = new Promise(res => {
+  try {
+    const r = indexedDB.open('snore', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('clips', { keyPath: 'id', autoIncrement: true });
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => res();
+  } catch (e) { res(); }
+});
+const tx = (mode) => db.transaction('clips', mode).objectStore('clips');
+const dbAll = () => new Promise(res => { if (!db) return res([]); const q = tx('readonly').getAll(); q.onsuccess = () => res(q.result); q.onerror = () => res([]); });
+const dbPut = (c) => new Promise(res => { if (!db) return res(); const q = tx('readwrite').put(c); q.onsuccess = () => res(); q.onerror = () => res(); });
+const dbDel = (id) => new Promise(res => { if (!db) return res(); const q = tx('readwrite').delete(id); q.onsuccess = () => res(); q.onerror = () => res(); });
+const dbClear = () => new Promise(res => { if (!db) return res(); const q = tx('readwrite').clear(); q.onsuccess = () => res(); q.onerror = () => res(); });
+
+// ---------- WAV ----------
+function makeWav(chunks, rate) {
+  let n = 0; for (const c of chunks) n += c.length;
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of chunks) for (let i = 0; i < c.length; i++) {
+    const s = Math.max(-1, Math.min(1, c[i])); v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true); o += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// ---------- 検知 ----------
+let ctx, stream, src, analyser, proc, running = false, wakeLock = null;
+let outRate = 16000, factor = 3;
+let preroll = [], preSamples = 0;       // 録音前の保持
+let clip = null;                         // 録音中データ
+let floorDb = null, calibFrames = 0;
+let sinceLoud = 0, snoreRun = 0, prevSnore = false, lastBurstT = -99, tNow = 0;
+let margin = 12;
+let tf, fq;
+
+function frameFeatures() {
+  analyser.getFloatTimeDomainData(tf);
+  let s = 0; for (let i = 0; i < tf.length; i++) s += tf[i] * tf[i];
+  const db = 10 * Math.log10(s / tf.length + 1e-12);
+  analyser.getFloatFrequencyData(fq);
+  const binHz = ctx.sampleRate / analyser.fftSize;
+  let lo = 0, all = 0;
+  for (let i = 1; i < fq.length; i++) {
+    const f = i * binHz; if (f < 80 || f > 8000) continue;
+    const p = Math.pow(10, fq[i] / 10);
+    all += p; if (f <= 800) lo += p;
+  }
+  return { db, ratio: all > 0 ? lo / all : 0 };
+}
+
+function onAudio(e) {
+  const inp = e.inputBuffer.getChannelData(0);
+  const n = Math.floor(inp.length / factor), out = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let a = 0; for (let k = 0; k < factor; k++) a += inp[i * factor + k]; out[i] = a / factor; }
+  const dt = inp.length / ctx.sampleRate; tNow += dt;
+
+  const { db, ratio } = frameFeatures();
+  if (floorDb === null) floorDb = db;
+  if (calibFrames < 35) { calibFrames++; floorDb = Math.min(floorDb, db) * 0.5 + floorDb * 0.5; }
+  const loud = db > floorDb + margin;
+  const snoreLike = calibFrames >= 35 && loud && ratio > LOW_RATIO_MIN;
+  if (!clip && !loud) floorDb = floorDb * 0.995 + db * 0.005;   // 環境音に追従
+
+  // バースト数(いびき1回)
+  if (snoreLike && !prevSnore && tNow - lastBurstT > 1.2) { lastBurstT = tNow; if (clip) clip.bursts++; }
+  prevSnore = snoreLike;
+  snoreRun = snoreLike ? snoreRun + 1 : 0;
+
+  if (!clip) {
+    preroll.push(out); preSamples += out.length;
+    while (preSamples - preroll[0].length > PRE_SEC * outRate) preSamples -= preroll.shift().length;
+    if (snoreRun >= 3) {
+      clip = { chunks: preroll.slice(), samples: preSamples, start: Date.now() - (preSamples / outRate) * 1000, bursts: 1, peak: db };
+      preroll = []; preSamples = 0; sinceLoud = 0;
+    }
+  } else {
+    clip.chunks.push(out); clip.samples += out.length;
+    clip.peak = Math.max(clip.peak, db);
+    if (snoreLike) sinceLoud = 0; else sinceLoud += out.length;
+    if (sinceLoud > GAP_SEC * outRate || clip.samples > MAX_SEC * outRate) finishClip();
+  }
+  updateUI(db, snoreLike);
+}
+
+async function finishClip(force) {
+  const c = clip; clip = null; if (!c) return;
+  // 末尾の無音をTAIL_SECだけ残して削る
+  let trim = Math.max(0, sinceLoud - TAIL_SEC * outRate), total = c.samples;
+  while (trim > 0 && c.chunks.length) {
+    const last = c.chunks[c.chunks.length - 1];
+    if (last.length <= trim) { trim -= last.length; total -= last.length; c.chunks.pop(); }
+    else { c.chunks[c.chunks.length - 1] = last.subarray(0, last.length - trim); total -= trim; trim = 0; }
+  }
+  sinceLoud = 0;
+  if (c.bursts < MIN_BURSTS && !force) return;   // 咳・物音など単発は捨てる
+  const blob = makeWav(c.chunks, outRate);
+  await dbPut({ start: c.start, dur: total / outRate, bursts: c.bursts, peak: Math.round(c.peak), blob });
+  renderList();
+}
+
+// ---------- UI ----------
+let lastUi = 0;
+function updateUI(db, snoreLike) {
+  const now = performance.now(); if (now - lastUi < 80) return; lastUi = now;
+  const pct = Math.max(0, Math.min(100, (db + 80) / 80 * 100));
+  $('bar').style.width = pct + '%';
+  $('bar').style.background = snoreLike ? 'var(--red)' : 'var(--ok)';
+  if (floorDb !== null) $('thr').style.left = Math.max(0, Math.min(100, (floorDb + margin + 80) / 80 * 100)) + '%';
+  if (calibFrames < 35) $('status').textContent = '周囲の音を測っています…(静かにしてね)';
+  else if (clip) $('status').innerHTML = '<span class="rec">● 録音中</span> いびき ' + clip.bursts + '回 / ' + Math.round(clip.samples / outRate) + '秒';
+  else $('status').textContent = '監視中(いびきを待っています)';
+}
+
+const fmt = t => new Date(t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const urls = [];
+async function renderList() {
+  urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  const all = (await dbAll()).sort((a, b) => b.start - a.start);
+  const list = $('list'); list.innerHTML = '';
+  let tot = 0, bur = 0;
+  if (!all.length) list.innerHTML = '<p class="sub">まだ録音はありません。</p>';
+  for (const c of all) {
+    tot += c.dur; bur += c.bursts;
+    const u = URL.createObjectURL(c.blob); urls.push(u);
+    const d = document.createElement('div'); d.className = 'clip';
+    d.innerHTML = '<div class="meta">' + fmt(c.start) + '(' + Math.round(c.dur) + '秒・いびき約' + c.bursts + '回)</div>' +
+      '<audio controls preload="none" src="' + u + '"></audio>' +
+      '<div class="row"><a class="ghost" style="flex:1;text-align:center;text-decoration:none;color:inherit;background:#2a3350;border-radius:12px;padding:10px" download="snore-' + c.start + '.wav" href="' + u + '">保存</a>' +
+      '<button class="ghost" style="flex:1">削除</button></div>';
+    d.querySelector('button').onclick = async () => { await dbDel(c.id); renderList(); };
+    list.appendChild(d);
+  }
+  $('summary').textContent = all.length ? all.length + '件 / いびき約' + bur + '回' : '';
+}
+
+// ---------- 開始・停止 ----------
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  factor = Math.max(1, Math.round(ctx.sampleRate / 16000)); outRate = ctx.sampleRate / factor;
+  src = ctx.createMediaStreamSource(stream);
+  analyser = ctx.createAnalyser(); analyser.fftSize = 4096; analyser.smoothingTimeConstant = 0;
+  tf = new Float32Array(analyser.fftSize); fq = new Float32Array(analyser.frequencyBinCount);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(analyser); src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  proc.onaudioprocess = onAudio;
+  floorDb = null; calibFrames = 0; preroll = []; preSamples = 0; clip = null; tNow = 0; lastBurstT = -99;
+  running = true;
+  await requestWake();
+  $('btn').textContent = '監視をとめる'; $('btn').className = 'stop';
+  $('info').textContent = '録音形式: WAV ' + Math.round(outRate) + 'Hz モノラル';
+}
+async function stop() {
+  running = false;
+  if (clip) await finishClip(true);
+  try { proc.disconnect(); src.disconnect(); } catch (e) {}
+  stream.getTracks().forEach(t => t.stop()); await ctx.close();
+  if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
+  $('btn').textContent = '監視をはじめる'; $('btn').className = '';
+  $('status').textContent = '停止中'; $('bar').style.width = '0';
+}
+async function requestWake() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (running && document.visibilityState === 'visible') requestWake(); });
+
+$('btn').onclick = async () => {
+  try { running ? await stop() : await start(); }
+  catch (e) { $('status').textContent = 'マイクが使えませんでした: ' + (e.message || e) + '(Safariの設定でマイクを許可してね)'; }
+};
+$('sens').oninput = () => { margin = 28 - +$('sens').value; $('sensVal').textContent = $('sens').value; try { localStorage.setItem('sens', $('sens').value); } catch (e) {} };
+try { const s = localStorage.getItem('sens'); if (s) $('sens').value = s; } catch (e) {}
+$('sens').oninput();
+$('clear').onclick = async () => { if (confirm('録音を全部消しますか?')) { await dbClear(); renderList(); } };
+$('dimBtn').onclick = () => $('dim').classList.add('on');
+$('dim').onclick = () => $('dim').classList.remove('on');
+dbReady.then(renderList);
+})();
+</script>
+</body>
+</html>
